@@ -8,7 +8,7 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI
-    ? [['list'], ['html', { open: 'never' }], ['junit', { outputFile: 'playwright-results/results.xml' }]]
+    ? [['list'], ['html', { open: 'never' }], ['junit', { outputFile: 'test-results/results.xml' }]]
     : [['list']],
   timeout: 30_000,
   expect: {
