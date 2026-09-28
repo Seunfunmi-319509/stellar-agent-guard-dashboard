@@ -35,15 +35,25 @@ export function findFlagged(addresses: string[] | undefined): string[] {
 export function findFlaggedInDraft(options: { assets?: string; recipients?: string; protocols?: string }): string[] {
   const { assets = "", recipients = "", protocols = "" } = options;
 
-  const assetsList = assets.split(/\r?\n/).map((s) => s.split(" ")[0]).map((s) => s.trim()).filter(Boolean);
-  const recipientsList = recipients.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const assetsList = assets
+    .split(/\r?\n/)
+    .map((s) => ((s ?? "").split(" ")[0] ?? ""))
+    .map((s) => (s ?? "").trim())
+    .filter(Boolean);
+  const recipientsList = recipients
+    .split(/\r?\n/)
+    .map((s) => (s ?? "").trim())
+    .filter(Boolean);
 
   // protocols lines may be of the form: ADDRESS or ADDRESS:fn
   const protocolsList = protocols
     .split(/\r?\n/)
-    .map((s) => s.trim())
+    .map((s) => (s ?? "").trim())
     .filter(Boolean)
-    .map((s) => (s.includes(":") ? s.split(":")[0].trim() : s));
+    .map((s) => {
+      const ss = s ?? "";
+      return ss.includes(":") ? (ss.split(":")[0] ?? "").trim() : ss;
+    });
 
   const all = [...assetsList, ...recipientsList, ...protocolsList];
   return Array.from(new Set(findFlagged(all)));
