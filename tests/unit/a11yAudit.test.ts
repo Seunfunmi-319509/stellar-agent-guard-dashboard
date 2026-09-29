@@ -8,8 +8,11 @@ import { PolicyForm } from "../../components/PolicyForm.tsx";
 import { PanicPanel } from "../../components/PanicPanel.tsx";
 import { DeployPanel } from "../../components/DeployPanel.tsx";
 import { TxHistoryTable } from "../../components/TxHistoryTable.tsx";
+import { MaliciousAddressModal } from "../../components/MaliciousAddressModal.tsx";
 import { GuardContext } from "../../components/GuardProvider.tsx";
 import { TX_HISTORY_STORAGE_KEY, type TxHistoryEntry } from "../../lib/guard/txHistory.ts";
+import { MALICIOUS_ADDRESS_REGISTRY, screenDraft } from "../../lib/guard/securityChecker.ts";
+import { EMPTY_DRAFT } from "../../lib/guard/policyForm.ts";
 
 installDom();
 
@@ -158,6 +161,34 @@ test("the freeze confirmation dialog passes axe-core while open", async () => {
 
     const violations = await axeViolations(rendered.container);
     assert.deepEqual(violations, [], "the open dialog must pass axe-core");
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("the flagged-address warning passes axe-core while open", async () => {
+  // Same treatment as the freeze confirmation: a new modal that is not scanned
+  // is a modal nobody has looked at, and this one carries the operator's only
+  // notice that an address they are about to authorise is reported as malicious.
+  const screen = screenDraft({ ...EMPTY_DRAFT, recipients: MALICIOUS_ADDRESS_REGISTRY[0]!.address });
+  const rendered = await renderPanel(
+    react.createElement(MaliciousAddressModal, {
+      screen,
+      onCancel: () => {},
+      onProceed: () => {},
+      returnFocusTo: { current: null },
+    }),
+  );
+  try {
+    const dialog = rendered.container.querySelector<HTMLElement>('[role="dialog"]');
+    assert.ok(dialog, "the warning must render as a dialog");
+    assert.equal(dialog.getAttribute("aria-modal"), "true");
+    assert.ok(
+      dialog.ownerDocument.getElementById(dialog.getAttribute("aria-labelledby") ?? ""),
+      "the dialog must be labelled by an existing element",
+    );
+    const violations = await axeViolations(rendered.container);
+    assert.deepEqual(violations, [], "the open warning must pass axe-core");
   } finally {
     await rendered.unmount();
   }
