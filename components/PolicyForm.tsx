@@ -19,7 +19,9 @@ import {
   parseAssetCapsJson,
   type AssetCapChange,
 } from "../lib/guard/assetCapsCsv.ts";
+import { screenDraft, screenKey } from "../lib/guard/securityChecker.ts";
 import { useGuard } from "./GuardProvider.tsx";
+import { MaliciousAddressModal } from "./MaliciousAddressModal.tsx";
 import { ErrorBlock, ScopeNotice, starLink } from "./bits.tsx";
 
 /**
@@ -46,6 +48,17 @@ export function PolicyForm() {
   const csvInput = useRef<HTMLInputElement>(null);
   const jsonInput = useRef<HTMLInputElement>(null);
 
+  // The flagged-address gate (issue #146). A hit on the embedded warning registry
+  // must not reach a signature prompt, so a submit is intercepted and turned into
+  // the warning modal until the operator has cleared both of its gates.
+  //
+  // `clearedKey` rather than a boolean, because consent is to a specific list of
+  // addresses: confirming the policy above and then appending another flagged
+  // address re-arms the gate instead of riding in on the earlier approval.
+  const [clearedKey, setClearedKey] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<null | { exportOnly: boolean }>(null);
+  const submitRef = useRef<HTMLButtonElement>(null);
+
   // Editing starts from the policy that is actually installed, not from an empty
   // form that looks like a reset. With nothing installed yet, it starts empty.
   const installedDraft =
@@ -56,6 +69,12 @@ export function PolicyForm() {
 
   const validation = buildPolicyConfig(effective);
   const issues = validation.ok ? [] : validation.issues;
+
+  // Screened during render, like the validation above it, so the warning and the
+  // disabled state can never disagree about what the draft contains.
+  const screen = screenDraft(effective);
+  const screenFingerprint = screenKey(effective);
+  const awaitingOverride = screen.flagged && clearedKey !== screenFingerprint;
 
   function set<K extends keyof PolicyDraft>(key: K, value: PolicyDraft[K]) {
     setDraft((current) => ({ ...(current ?? installedDraft), [key]: value }));
@@ -84,6 +103,34 @@ export function PolicyForm() {
     link.download = filename;
     link.click();
     URL.revokeObjectURL(url);
+  }
+
+  /**
+   * The single entry point for both policy-write buttons.
+   *
+   * A draft carrying a flagged address is diverted to the warning modal instead
+   * of reaching the wallet. XDR export is gated by the same path on purpose: an
+   * exported envelope is a policy update too, and it is the one an operator
+   * signs later on a hardware wallet, out of reach of this warning.
+   */
+  function requestSubmit(exportOnly: boolean) {
+    if (awaitingOverride) {
+      setPendingAction({ exportOnly });
+      return;
+    }
+    void submit(exportOnly);
+  }
+
+  function proceedDespiteFlaggedAddresses() {
+    const action = pendingAction;
+    if (!action) return;
+    setClearedKey(screenFingerprint);
+    setPendingAction(null);
+    void submit(action.exportOnly);
+  }
+
+  function cancelOverride() {
+    setPendingAction(null);
   }
 
   async function submit(exportOnly = false) {
@@ -412,11 +459,37 @@ export function PolicyForm() {
         </div>
       )}
 
+      {screen.flagged && (
+        <div className="error" role="status">
+          <span className="t">
+            {screen.findings.length === 1
+              ? "1 address in this policy is on the warning registry"
+              : `${screen.findings.length} addresses in this policy are on the warning registry`}
+          </span>
+          <ul style={{ margin: "4px 0 0 16px", padding: 0 }}>
+            {screen.findings.map((finding) => (
+              <li key={`${finding.field}-${finding.address}-${finding.entered}`} className="tiny">
+                <span className="mono">{finding.address}</span> in {finding.field} — {finding.entry.reason}
+              </li>
+            ))}
+          </ul>
+          <span className="tiny">
+            {awaitingOverride
+              ? "Signing will require an explicit override in a warning dialog."
+              : `Override recorded for this address list. Editing the addresses above will ask again. Registry ${screen.version}.`}
+          </span>
+        </div>
+      )}
+
       <div className="row" style={{ marginTop: 14 }}>
-        <button disabled={!wallet || busy || issues.length > 0} onClick={() => void submit()}>
+        <button
+          ref={submitRef}
+          disabled={!wallet || busy || issues.length > 0}
+          onClick={() => requestSubmit(false)}
+        >
           {busy ? "Working…" : "Sign and install policy"}
         </button>
-        <button className="secondary" disabled={!wallet || busy || issues.length > 0} onClick={() => void submit(true)}>
+        <button className="secondary" disabled={!wallet || busy || issues.length > 0} onClick={() => requestSubmit(true)}>
           Export XDR
         </button>
         <button className="secondary" disabled={!wallet || busy} onClick={() => void revoke()}>
@@ -436,6 +509,15 @@ export function PolicyForm() {
       </div>
 
       {error && <ErrorBlock title="The policy write did not complete" detail={error} />}
+
+      {pendingAction && (
+        <MaliciousAddressModal
+          screen={screen}
+          onCancel={cancelOverride}
+          onProceed={proceedDespiteFlaggedAddresses}
+          returnFocusTo={submitRef}
+        />
+      )}
 
       {outcome?.kind === "invoked" && <OutcomeBlock result={outcome.result} verb="set_policy" onClose={() => setOutcome(null)} />}
       {outcome?.kind === "invalid" && (
