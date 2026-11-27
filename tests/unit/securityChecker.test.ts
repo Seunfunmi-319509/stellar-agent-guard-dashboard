@@ -134,7 +134,11 @@ test("surrounding whitespace and a bare trailing newline do not hide a hit", () 
 
 test("a clean policy is not flagged, and says how much it screened", () => {
   const result = screenDraft(
-    draft({ assets: CLEAN_CONTRACT, recipients: CLEAN_RECIPIENT, protocols: `${CLEAN_CONTRACT}:swap` }),
+    draft({
+      assets: CLEAN_CONTRACT,
+      recipients: CLEAN_RECIPIENT,
+      protocols: `${CLEAN_CONTRACT}:swap`,
+    }),
   );
   assert.equal(result.flagged, false);
   assert.deepEqual(result.findings, []);

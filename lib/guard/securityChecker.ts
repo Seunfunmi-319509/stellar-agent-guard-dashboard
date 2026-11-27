@@ -45,12 +45,7 @@ export const REGISTRY_VERSION = "2026.09.1";
 export const REGISTRY_UPDATED_AT = "2026-09-29";
 
 /** How the address came to be flagged. Drives the operator-facing wording. */
-export type RegistryCategory =
-  | "phishing"
-  | "drainer"
-  | "impersonation"
-  | "fraud"
-  | "scam";
+export type RegistryCategory = "phishing" | "drainer" | "impersonation" | "fraud" | "scam";
 
 export interface RegistryEntry {
   /** The flagged address, canonical form. */
@@ -78,7 +73,7 @@ export const MALICIOUS_ADDRESS_REGISTRY: readonly RegistryEntry[] = [
     address: "GDPDCU4UL7RMDMJSV2QNUWEVWVVZUNUQ5427YE33BYHQCGWVJR2JAFEB",
     category: "impersonation",
     reason:
-      "Issuer of the AMEC \"sse.cn.com\" asset, reported as impersonating the Shanghai Stock Exchange to sell tokenised equities. Carries a fraud report on Stellar Expert.",
+      'Issuer of the AMEC "sse.cn.com" asset, reported as impersonating the Shanghai Stock Exchange to sell tokenised equities. Carries a fraud report on Stellar Expert.',
     reportedAt: "2026-09-29",
     source:
       "https://stellar.expert/explorer/public/asset/AMEC-GDPDCU4UL7RMDMJSV2QNUWEVWVVZUNUQ5427YE33BYHQCGWVJR2JAFEB",
@@ -95,8 +90,7 @@ export const MALICIOUS_ADDRESS_REGISTRY: readonly RegistryEntry[] = [
   {
     address: "GA2IZUQLK56OCXMRPAUL4R46CN62D2MHPHXLOPUL6F6G3JJFHAZF6CYS",
     category: "scam",
-    reason:
-      "Issuer of the CondorAI asset, reported for illicit or fraudulent activity.",
+    reason: "Issuer of the CondorAI asset, reported for illicit or fraudulent activity.",
     reportedAt: "2026-09-29",
     source:
       "https://stellar.expert/explorer/public/asset/CondorAI-GA2IZUQLK56OCXMRPAUL4R46CN62D2MHPHXLOPUL6F6G3JJFHAZF6CYS",
@@ -114,7 +108,7 @@ export const MALICIOUS_ADDRESS_REGISTRY: readonly RegistryEntry[] = [
     address: "GBNLJIYH34UWO5YZFA3A3HD3N76R6DOI33N4JONUOHEEYZYCAYTEJ5AK",
     category: "scam",
     reason:
-      "Issuer of the RIO \"realio.fund\" asset, reported for illicit or fraudulent activity. The account is flagged as deprecated.",
+      'Issuer of the RIO "realio.fund" asset, reported for illicit or fraudulent activity. The account is flagged as deprecated.',
     reportedAt: "2026-09-29",
     source:
       "https://stellar.expert/explorer/public/asset/RIO-GBNLJIYH34UWO5YZFA3A3HD3N76R6DOI33N4JONUOHEEYZYCAYTEJ5AK",
@@ -122,8 +116,7 @@ export const MALICIOUS_ADDRESS_REGISTRY: readonly RegistryEntry[] = [
   {
     address: "GBC7NIEHS6Q4EKHQAB7GPPNUPVVXX43D4VPWNO44X5YTLN4WKZZ53SAR",
     category: "scam",
-    reason:
-      "Issuer of the BRICS asset, reported for illicit or fraudulent activity.",
+    reason: "Issuer of the BRICS asset, reported for illicit or fraudulent activity.",
     reportedAt: "2026-09-29",
     source:
       "https://stellar.expert/explorer/public/asset/BRICS-GBC7NIEHS6Q4EKHQAB7GPPNUPVVXX43D4VPWNO44X5YTLN4WKZZ53SAR",
@@ -290,7 +283,10 @@ export function screenDraft(draft: PolicyDraft): DraftScreen {
  */
 export function screenKey(draft: PolicyDraft): string {
   return draftAddressCandidates(draft)
-    .map((candidate) => `${candidate.field}:${canonicalIdentity(candidate.entered) ?? candidate.entered}`)
+    .map(
+      (candidate) =>
+        `${candidate.field}:${canonicalIdentity(candidate.entered) ?? candidate.entered}`,
+    )
     .join("|");
 }
 

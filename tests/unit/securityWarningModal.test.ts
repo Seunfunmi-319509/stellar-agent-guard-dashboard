@@ -3,9 +3,14 @@ import { before, test } from "node:test";
 import type { ReactElement } from "react";
 import { installDom, loadReact, sleep, type Act } from "./domHarness.ts";
 import { PolicyForm } from "../../components/PolicyForm.tsx";
-import { GuardContext } from "../../components/GuardProvider.tsx";
+import { GuardContext, GuardEventsContext } from "../../components/GuardProvider.tsx";
 import { MaliciousAddressModal } from "../../components/MaliciousAddressModal.tsx";
-import { CRITICAL_ADDRESS_WARNING, MALICIOUS_ADDRESS_REGISTRY, OVERRIDE_PHRASE, screenDraft } from "../../lib/guard/securityChecker.ts";
+import {
+  CRITICAL_ADDRESS_WARNING,
+  MALICIOUS_ADDRESS_REGISTRY,
+  OVERRIDE_PHRASE,
+  screenDraft,
+} from "../../lib/guard/securityChecker.ts";
 import { EMPTY_DRAFT, type PolicyDraft } from "../../lib/guard/policyForm.ts";
 
 /**
@@ -35,11 +40,27 @@ before(async () => {
 const FLAGGED = MALICIOUS_ADDRESS_REGISTRY[0]!.address;
 const CLEAN = "GAOBCRXTCO4ZCBNHALJUMJJ5JDXNOUZ7U6VZJX4UBTXAHQEO66IPU6PH";
 
-/** `signer()` throws, so any path that reaches the wallet fails the test loudly. */
-const noNetworkServer = new Proxy(
-  {},
-  { get: () => () => Promise.reject(new Error("network disabled in unit tests")) },
-);
+/**
+ * Every RPC read rejects, so a clean install degrades the way it does offline.
+ *
+ * A plain object rather than a catch-all `Proxy`: a proxy that answers every
+ * property also answers `then`, `toJSON`, `Symbol.iterator` and the rest, which
+ * turns the server into a thenable/iterable for any code that probes it.
+ */
+const offline = () => Promise.reject(new Error("network disabled in unit tests"));
+const noNetworkServer = {
+  getAccount: offline,
+  simulateTransaction: offline,
+  prepareTransaction: offline,
+  sendTransaction: offline,
+  getTransaction: offline,
+  getLedgerEntries: offline,
+  getContractInstance: offline,
+  getContractWasmByContractId: offline,
+  getLatestLedger: offline,
+  getEvents: offline,
+  getAssetBalance: offline,
+};
 
 const TEST_GUARD = {
   server: noNetworkServer,
@@ -106,7 +127,11 @@ function renderForm(): ReactElement {
   return react.createElement(
     GuardContext.Provider,
     { value: TEST_GUARD },
-    react.createElement(PolicyForm),
+    react.createElement(
+      GuardEventsContext.Provider,
+      { value: [] },
+      react.createElement(PolicyForm),
+    ),
   );
 }
 
@@ -126,7 +151,9 @@ function setFieldValue(container: HTMLElement, label: RegExp, value: string): vo
   const input = field.querySelector("input, textarea");
   assert.ok(input, "the field must have an editable control");
   const setter = Object.getOwnPropertyDescriptor(
-    input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
+    input instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype,
     "value",
   )!.set!;
   setter.call(input, value);
@@ -212,19 +239,29 @@ test("XDR export is gated by the same warning, since it is signed later elsewher
   }
 });
 
-test("a clean policy opens no dialog at all", async () => {
+test("a clean policy goes straight to the change review, with no flagged-address warning", async () => {
+  // Every install opens the "Policy changes" review before the wallet is
+  // prompted, so "no dialog" is not the signal. What must not appear is the
+  // flagged-address warning: a clean draft passes the gate untouched and lands
+  // on the ordinary review step.
   const rendered = await render(renderForm());
   try {
     await typeRecipients(rendered.container, CLEAN);
     await act(async () => {
       buttonByText(rendered.container, "Sign and install policy").click();
     });
-    // `signer()` throws, so a thrown error here means the click was intercepted.
+    const text = rendered.container.textContent ?? "";
     assert.equal(
-      rendered.container.querySelector('[role="dialog"]'),
-      null,
+      text.includes(CRITICAL_ADDRESS_WARNING),
+      false,
       "a policy with no flagged address must not be gated",
     );
+    assert.equal(
+      rendered.container.querySelector("#ack-flagged-address") === null,
+      true,
+      "the override controls must not be offered for a clean policy",
+    );
+    assert.ok(text.includes("Policy changes"), "the click must reach the normal change review");
   } finally {
     await rendered.unmount();
   }
@@ -261,7 +298,9 @@ test("the dialog is a real dialog: labelled, described, and focused on open", as
       "aria-labelledby must reference the visible title",
     );
     assert.ok(
-      rendered.container.ownerDocument.getElementById(dialog.getAttribute("aria-describedby") ?? ""),
+      rendered.container.ownerDocument.getElementById(
+        dialog.getAttribute("aria-describedby") ?? "",
+      ),
       "aria-describedby must reference real text",
     );
     assert.equal(document.activeElement, dialog, "opening the dialog must move focus into it");
@@ -368,7 +407,11 @@ test("Escape closes the dialog and returns focus to the control that opened it",
       );
     });
 
-    assert.equal(rendered.container.querySelector('[role="dialog"]'), null);
+    assert.equal(
+      rendered.container.querySelector('[role="dialog"]') === null,
+      true,
+      "Escape must close the dialog",
+    );
     assert.equal(
       document.activeElement,
       buttonByText(rendered.container, "Sign and install policy"),

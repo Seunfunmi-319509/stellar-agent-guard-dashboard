@@ -123,7 +123,8 @@ export function MaliciousAddressModal({
               <div className="mono">{finding.address}</div>
               {finding.viaMuxedAlias && (
                 <div className="tiny" style={{ color: "var(--danger)" }}>
-                  You entered a muxed form of this account: <span className="mono">{finding.entered}</span>
+                  You entered a muxed form of this account:{" "}
+                  <span className="mono">{finding.entered}</span>
                 </div>
               )}
               <div className="tiny">{finding.entry.reason}</div>
@@ -170,12 +171,7 @@ export function MaliciousAddressModal({
         </label>
 
         <div className="row">
-          <button
-            className="danger"
-            ref={proceedRef}
-            disabled={!ready}
-            onClick={onProceed}
-          >
+          <button className="danger" ref={proceedRef} disabled={!ready} onClick={onProceed}>
             Sign with flagged addresses
           </button>
           <button className="secondary" onClick={onCancel}>
