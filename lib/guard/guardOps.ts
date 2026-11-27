@@ -8,8 +8,7 @@
  */
 
 import { Account, Address, Operation, TransactionBuilder, rpc, xdr } from "@stellar/stellar-sdk";
-import { sha256Hex } from "./scval.ts";
-import type { GuardStatus, PolicyConfig } from "stellar-agent-guard-sdk";
+import { verifyGuardWasm, type GuardStatus, type PolicyConfig } from "stellar-agent-guard-sdk";
 import { NETWORK, PHASE1_ARTIFACT } from "./network.ts";
 import { buildPolicyConfig, type PolicyDraft } from "./policyForm.ts";
 import {
@@ -26,17 +25,23 @@ import {
 } from "./chain.ts";
 import {
   INCLUSION_FEE,
+  actionableCancellationMessage,
   assembleFromSimulation,
   buildInitialEnvelope,
   describeRejectedResult,
+  isWalletCancellation,
   diagnosticEventsOf,
   invokeWithWallet,
+  previewAuthorizationSummary,
+  writeBoundary,
   type InvokeResult,
   type WalletSigner,
 } from "./submit.ts";
+import type { AuthorizationContext } from "./authorizationSummary.ts";
 import { addressToScVal, hexToBytes } from "./scval.ts";
 import { announce } from "./useAnnounce.ts";
 import { recordTx } from "./txHistory.ts";
+import { contractAlreadyDeployed } from "./saltGenerator.ts";
 
 // ── Artifact identity ──────────────────────────────────────────────────────
 
@@ -174,13 +179,36 @@ export async function submitOperation(params: {
     };
   }
 
+  // A deploy or an upload is reviewed on the panel before this runs, and the
+  // wallet can move to another account while that panel is open. The boundary
+  // is re-read here exactly as it is for a contract call, so a deployment can
+  // never be signed — or broadcast — by an account other than the one that was
+  // on screen (issue #349).
+  const beforeEnvelope = await writeBoundary(signer, "envelope");
+  if (beforeEnvelope) return beforeEnvelope;
+
   announce("Please approve transaction in Freighter");
-  const signedXdr = await signer.signTransaction(prepared.toXDR());
+  let signedXdr: string;
+  try {
+    signedXdr = await signer.signTransaction(prepared.toXDR());
+  } catch (error) {
+    // The deploy's own steps take the same route as every other write: a decline
+    // is the operator's decision and becomes its own outcome, so the panel can
+    // offer a retry instead of reporting a failure that never reached the
+    // network (issue #291). Only a decline is caught — any other signer error
+    // still propagates to the caller.
+    if (!isWalletCancellation(error)) throw error;
+    announce("Signing declined in the wallet — nothing was broadcast", "assertive");
+    return { kind: "cancelled", detail: actionableCancellationMessage(error) };
+  }
   const transaction = TransactionBuilder.fromXDR(signedXdr, passphrase);
 
   // The envelope's fee field carries inclusion fee + resource fee — exactly
   // what the network will charge for this transaction.
   const feeStroops = transaction.fee;
+
+  const beforeSend = await writeBoundary(signer, "submission");
+  if (beforeSend) return beforeSend;
 
   const sent = await server.sendTransaction(transaction);
   if (sent.status === "ERROR") {
@@ -201,7 +229,14 @@ export async function submitOperation(params: {
     if (!result) continue;
     if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) {
       const ledger = (result as { ledger?: number }).ledger ?? null;
-      recordTx({ hash: sent.hash, operation: label, status: "confirmed", feeStroops });
+      recordTx({
+        hash: sent.hash,
+        operation: label,
+        status: "confirmed",
+        feeStroops,
+        networkName: NETWORK.name,
+        networkPassphrase: passphrase,
+      });
       announce(
         ledger !== null
           ? `Transaction confirmed on ledger ${ledger}`
@@ -217,7 +252,14 @@ export async function submitOperation(params: {
       };
     }
     if (result.status === rpc.Api.GetTransactionStatus.FAILED) {
-      recordTx({ hash: sent.hash, operation: label, status: "failed", feeStroops });
+      recordTx({
+        hash: sent.hash,
+        operation: label,
+        status: "failed",
+        feeStroops,
+        networkName: NETWORK.name,
+        networkPassphrase: passphrase,
+      });
       announce("Transaction failed on chain");
       return {
         kind: "failed",
@@ -230,7 +272,14 @@ export async function submitOperation(params: {
       };
     }
   }
-  recordTx({ hash: sent.hash, operation: label, status: "failed", feeStroops });
+  recordTx({
+    hash: sent.hash,
+    operation: label,
+    status: "failed",
+    feeStroops,
+    networkName: NETWORK.name,
+    networkPassphrase: passphrase,
+  });
   announce("Transaction failed on chain");
   return {
     kind: "failed",
@@ -281,14 +330,92 @@ export interface DeployOutcome {
   steps: DeployStep[];
   /** The deployed instance's identity, re-read from the chain after the create. */
   identity: WasmIdentity | null;
+  /**
+   * Why the post-deploy read produced no identity, or null when it was never
+   * reached, or when it succeeded. Kept separate from `identity` so a transport
+   * failure is reported as an unavailable read rather than as a wrong artifact —
+   * and so the deployment receipt can record a failed read explicitly.
+   */
+  readError: string | null;
   /** True only when the created instance runs the pinned artifact. */
   verified: boolean;
+}
+
+/**
+ * Where a deploy's steps actually got to (issue #291).
+ *
+ * `steps` only ever grows forwards, so the *last* step is the one that decided
+ * the outcome — and the earlier ones say whether any part of the deploy already
+ * reached the chain. Keeping this classification out of the panel is what lets
+ * a decline, a pre-broadcast refusal and an on-chain rejection be worded
+ * differently instead of all rendering as "the deploy failed".
+ */
+export type DeployProgress =
+  | {
+      /** The wallet declined the signature: that step never left the browser. */
+      kind: "declined";
+      detail: string;
+      /** Labels of the earlier steps that did reach the network. */
+      landed: string[];
+    }
+  | {
+      /** Simulation, guard enforcement, RPC or submission — nothing broadcast. */
+      kind: "refused";
+      detail: string;
+      landed: string[];
+    }
+  | {
+      /** Broadcast and rejected after inclusion in a ledger. */
+      kind: "failed";
+      detail: string;
+      landed: string[];
+    }
+  | {
+      /** The create transaction was accepted; verification decides if it is good. */
+      kind: "created";
+    };
+
+export function classifyDeploySteps(steps: DeployStep[]): DeployProgress {
+  const landed = steps
+    .filter((step) => step.result.kind === "submitted" || step.result.kind === "failed")
+    .map((step) => step.label);
+  const last = steps[steps.length - 1];
+  if (!last) return { kind: "refused", detail: "no deploy step ran", landed: [] };
+  const detail =
+    "detail" in last.result && typeof last.result.detail === "string" ? last.result.detail : "";
+  switch (last.result.kind) {
+    case "cancelled":
+      return { kind: "declined", detail, landed };
+    case "failed":
+      return { kind: "failed", detail, landed };
+    case "submitted":
+      return { kind: "created" };
+    default:
+      return { kind: "refused", detail, landed };
+  }
 }
 
 export class GuardOperationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "GuardOperationError";
+  }
+}
+
+async function assertDeploymentAddressAvailable(
+  server: rpc.Server,
+  address: string,
+): Promise<void> {
+  const lookup = await contractAlreadyDeployed(server, address);
+  if (lookup.error) {
+    throw new GuardOperationError(
+      `could not inspect predicted address ${address}: ${lookup.error}; refusing to deploy`,
+    );
+  }
+  if (lookup.exists) {
+    throw new GuardOperationError(
+      `predicted address ${address} already exists; change the deployer or salt before deploying again`,
+    );
   }
 }
 
@@ -316,24 +443,25 @@ export async function deployGuard(params: {
     params.onStep?.(step);
   };
 
-  const artifact = await checkArtifact(server);
-  if (!artifact.ok) throw new GuardOperationError(artifact.detail);
-
   const predicted = await predictContractId({
     deployerPublicKey: signer.address,
     salt,
     ...(params.passphrase !== undefined ? { passphrase: params.passphrase } : {}),
   });
+  await assertDeploymentAddressAvailable(server, predicted);
+
+  const artifact = await checkArtifact(server);
+  if (!artifact.ok) throw new GuardOperationError(artifact.detail);
 
   // ── Ensure the exact bytecode is a live code entry ─────────────────────
   const present = await artifactCodePresent(server, PHASE1_ARTIFACT.wasmHash);
   if (!present.ok) throw new GuardOperationError(`could not read the code entry: ${present.error}`);
   if (!present.value) {
     const wasm = await fetchContractWasm(server, PHASE1_ARTIFACT.guard);
-    const fetchedHash = await sha256Hex(wasm);
-    if (fetchedHash !== PHASE1_ARTIFACT.wasmHash) {
+    const verification = await verifyGuardWasm(wasm, PHASE1_ARTIFACT.wasmHash);
+    if (!verification.ok) {
       throw new GuardOperationError(
-        `refusing to upload: fetched bytes hash to ${fetchedHash}, not the pinned ${PHASE1_ARTIFACT.wasmHash}`,
+        `refusing to upload: fetched bytes hash to ${verification.actual}, not the pinned ${verification.expected}`,
       );
     }
     const upload = await submitOperation({
@@ -345,10 +473,11 @@ export async function deployGuard(params: {
     });
     record(`upload_contract_wasm (${PHASE1_ARTIFACT.wasmBytes} bytes)`, upload);
     if (upload.kind !== "submitted") {
-      return { guard: predicted, steps, identity: null, verified: false };
+      return { guard: predicted, steps, identity: null, readError: null, verified: false };
     }
   }
 
+  await assertDeploymentAddressAvailable(server, predicted);
   const create = await submitOperation({
     server,
     signer,
@@ -366,21 +495,62 @@ export async function deployGuard(params: {
     create,
   );
   if (create.kind !== "submitted") {
-    return { guard: predicted, steps, identity: null, verified: false };
+    return { guard: predicted, steps, identity: null, readError: null, verified: false };
   }
 
-  const identity = await verifyWasmIdentity(server, predicted);
+  // A read failure after a submitted create is not the same fact as a wrong
+  // artifact. Catch it so the operator keeps the transaction references and the
+  // receipt can say "unavailable" instead of losing the whole outcome when the
+  // RPC hiccups at the last step.
+  let identity: WasmIdentity | null = null;
+  let readError: string | null = null;
+  try {
+    identity = await verifyWasmIdentity(server, predicted);
+  } catch (error) {
+    readError = error instanceof Error ? error.message : String(error);
+  }
   return {
     guard: predicted,
     steps,
     identity,
+    readError,
     verified:
+      identity !== null &&
       identity.fetchedSha256 === PHASE1_ARTIFACT.wasmHash &&
       identity.bytes === PHASE1_ARTIFACT.wasmBytes,
   };
 }
 
 // ── Initialize, policy, freeze ─────────────────────────────────────────────
+
+/**
+ * The authorization context a write is executed under (issue #343).
+ *
+ * A panel that showed the operator the operation, the guard, the network and the
+ * admin account passes that copy, and the pipeline checks it against the
+ * transaction it is about to simulate. A caller with no panel — the local sandbox
+ * script, the Phase 3 proof harness, a unit test driving one operation — gets the
+ * same reading of the same transaction from `previewAuthorizationSummary`, so the
+ * check runs on every write rather than only on the ones that remembered to ask.
+ * `null` means there was nothing to read (no admin address yet, so no wallet is
+ * connected), and the pipeline refuses a `null` authorization instead of treating
+ * the absence as agreement.
+ */
+function authorizationFor(params: {
+  contract: string;
+  fn: string;
+  admin: string;
+  passphrase: string;
+  confirmed: AuthorizationContext | null | undefined;
+}): AuthorizationContext | null {
+  if (params.confirmed !== undefined) return params.confirmed;
+  return previewAuthorizationSummary({
+    contract: params.contract,
+    fn: params.fn,
+    admin: params.admin,
+    passphrase: params.passphrase,
+  });
+}
 
 /** Register the admin (the connected wallet) and the agent's raw Ed25519 key. */
 export async function initializeGuard(params: {
@@ -389,6 +559,7 @@ export async function initializeGuard(params: {
   guard: string;
   agentPubkeyHex: string;
   passphrase?: string;
+  authorization?: AuthorizationContext | null;
 }): Promise<InvokeResult> {
   const pubkey = hexToBytes(params.agentPubkeyHex.trim());
   if (pubkey.length !== 32) {
@@ -399,13 +570,24 @@ export async function initializeGuard(params: {
       diagnosticEvents: [],
     };
   }
+  const passphrase = params.passphrase ?? NETWORK.passphrase;
   return invokeWithWallet({
     server: params.server,
     contract: params.guard,
     fn: "initialize",
     args: [addressToScVal(params.signer.address), xdr.ScVal.scvBytes(pubkey)],
     signer: params.signer,
+    // Initialize is the write this panel offers a retry for, so its decline is
+    // an outcome the operator can act on rather than a thrown error (issue #291).
+    cancelOnDecline: true,
     ...(params.passphrase !== undefined ? { passphrase: params.passphrase } : {}),
+    authorization: authorizationFor({
+      contract: params.guard,
+      fn: "initialize",
+      admin: params.signer.address,
+      passphrase,
+      confirmed: params.authorization,
+    }),
   });
 }
 
@@ -417,6 +599,7 @@ export async function installPolicy(params: {
   draft: PolicyDraft;
   passphrase?: string;
   exportOnly?: boolean;
+  authorization?: AuthorizationContext | null;
 }): Promise<{ kind: "invalid"; issues: string[] } | { kind: "invoked"; result: InvokeResult }> {
   const built = buildPolicyConfig(params.draft);
   if (!built.ok)
@@ -429,6 +612,13 @@ export async function installPolicy(params: {
     signer: params.signer,
     ...(params.passphrase !== undefined ? { passphrase: params.passphrase } : {}),
     ...(params.exportOnly !== undefined ? { exportOnly: params.exportOnly } : {}),
+    authorization: authorizationFor({
+      contract: params.guard,
+      fn: "set_policy",
+      admin: params.signer.address,
+      passphrase: params.passphrase ?? NETWORK.passphrase,
+      confirmed: params.authorization,
+    }),
   });
   return { kind: "invoked", result };
 }
@@ -440,6 +630,7 @@ export function freezeGuard(params: {
   guard: string;
   passphrase?: string;
   exportOnly?: boolean;
+  authorization?: AuthorizationContext | null;
 }): Promise<InvokeResult> {
   return invokeWithWallet({
     server: params.server,
@@ -449,6 +640,13 @@ export function freezeGuard(params: {
     signer: params.signer,
     ...(params.passphrase !== undefined ? { passphrase: params.passphrase } : {}),
     ...(params.exportOnly !== undefined ? { exportOnly: params.exportOnly } : {}),
+    authorization: authorizationFor({
+      contract: params.guard,
+      fn: "freeze",
+      admin: params.signer.address,
+      passphrase: params.passphrase ?? NETWORK.passphrase,
+      confirmed: params.authorization,
+    }),
   });
 }
 
@@ -633,6 +831,7 @@ export function unfreezeGuard(params: {
   guard: string;
   passphrase?: string;
   exportOnly?: boolean;
+  authorization?: AuthorizationContext | null;
 }): Promise<InvokeResult> {
   return invokeWithWallet({
     server: params.server,
@@ -642,6 +841,13 @@ export function unfreezeGuard(params: {
     signer: params.signer,
     ...(params.passphrase !== undefined ? { passphrase: params.passphrase } : {}),
     ...(params.exportOnly !== undefined ? { exportOnly: params.exportOnly } : {}),
+    authorization: authorizationFor({
+      contract: params.guard,
+      fn: "unfreeze",
+      admin: params.signer.address,
+      passphrase: params.passphrase ?? NETWORK.passphrase,
+      confirmed: params.authorization,
+    }),
   });
 }
 
@@ -652,6 +858,7 @@ export function revokePolicy(params: {
   guard: string;
   passphrase?: string;
   exportOnly?: boolean;
+  authorization?: AuthorizationContext | null;
 }): Promise<InvokeResult> {
   return invokeWithWallet({
     server: params.server,
@@ -661,6 +868,13 @@ export function revokePolicy(params: {
     signer: params.signer,
     ...(params.passphrase !== undefined ? { passphrase: params.passphrase } : {}),
     ...(params.exportOnly !== undefined ? { exportOnly: params.exportOnly } : {}),
+    authorization: authorizationFor({
+      contract: params.guard,
+      fn: "revoke_policy",
+      admin: params.signer.address,
+      passphrase: params.passphrase ?? NETWORK.passphrase,
+      confirmed: params.authorization,
+    }),
   });
 }
 
@@ -671,6 +885,7 @@ export async function rotateAgentKey(params: {
   guard: string;
   newAgentPubkeyHex: string;
   passphrase?: string;
+  authorization?: AuthorizationContext | null;
 }): Promise<InvokeResult> {
   const pubkey = hexToBytes(params.newAgentPubkeyHex.trim());
   if (pubkey.length !== 32) {
@@ -688,6 +903,13 @@ export async function rotateAgentKey(params: {
     args: [xdr.ScVal.scvBytes(pubkey)],
     signer: params.signer,
     ...(params.passphrase !== undefined ? { passphrase: params.passphrase } : {}),
+    authorization: authorizationFor({
+      contract: params.guard,
+      fn: "rotate_agent_key",
+      admin: params.signer.address,
+      passphrase: params.passphrase ?? NETWORK.passphrase,
+      confirmed: params.authorization,
+    }),
   });
 }
 
@@ -710,21 +932,36 @@ export interface GuardSnapshot {
   identity: ReadResult<WasmIdentity>;
 }
 
+/**
+ * Stamp a successful read with when it completed.
+ *
+ * The printed report must be able to say which sections were live reads and when
+ * each one returned; one batch timestamp would silently imply that a section
+ * which failed and was retried was as fresh as the others. Failures carry no
+ * timestamp because nothing was read.
+ */
+async function stamped<T>(read: Promise<ReadResult<T>>): Promise<ReadResult<T>> {
+  const result = await read;
+  return result.ok ? { ...result, readAt: new Date().toISOString() } : result;
+}
+
 export async function readGuardSnapshot(
   server: rpc.Server,
   guard: string,
   source?: string,
 ): Promise<GuardSnapshot> {
   const [status, policy, window, identity] = await Promise.all([
-    readStatus(server, guard, source),
-    readPolicy(server, guard, source),
-    readWindow(server, guard),
-    verifyWasmIdentity(server, guard)
-      .then((value): ReadResult<WasmIdentity> => ({ ok: true, value }))
-      .catch((error): ReadResult<WasmIdentity> => ({
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      })),
+    stamped(readStatus(server, guard, source)),
+    stamped(readPolicy(server, guard, source)),
+    stamped(readWindow(server, guard)),
+    stamped(
+      verifyWasmIdentity(server, guard)
+        .then((value): ReadResult<WasmIdentity> => ({ ok: true, value }))
+        .catch((error): ReadResult<WasmIdentity> => ({
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        })),
+    ),
   ]);
   return { guard, fetchedAt: new Date().toISOString(), status, policy, window, identity };
 }

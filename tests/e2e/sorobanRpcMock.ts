@@ -34,10 +34,12 @@ import {
   SorobanDataBuilder,
   TransactionBuilder,
   nativeToScVal,
+  scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
 import { NETWORK, PHASE1_ARTIFACT } from "../../lib/guard/network.ts";
 import { hashToHex } from "../../lib/guard/scval.ts";
+import { predictContractId } from "../../lib/guard/chain.ts";
 import { specToGuardEvent, type MockEventSpec } from "../mocks/eventFixtures.ts";
 
 const RPC_HOST = "soroban-testnet.stellar.org";
@@ -82,7 +84,29 @@ export interface MockChainOptions {
    * instead of relying on this.
    */
   eventBatchSize?: number;
+  /**
+   * What this chain says the Phase 1 artifact is (issue #351). Defaults to the
+   * genuine fixture, so every other spec is unaffected.
+   */
+  artifact?: ArtifactMode;
 }
+
+/**
+ * The artifact a mock chain serves, as the deploy gate reads it: the bytes of
+ * the code entry *and* the hash the instance declares for them.
+ *
+ * Both are derived from the same bytes on purpose. A mismatched artifact
+ * therefore declares its own hash, which keeps the mock internally consistent —
+ * the failure the panel reports is a mismatch against the pin, not a torn read
+ * where the ledger and the code entry disagree with each other.
+ */
+export type ArtifactMode =
+  /** The genuine fixture: hash and byte length both match the pin. */
+  | "pinned"
+  /** The right length, bytes that hash to something that is not the pin. */
+  | "hash-mismatch"
+  /** More bytes than the pin allows — a length mismatch of its own. */
+  | "length-mismatch";
 
 function readJsonFixture<T>(relativePath: string): T {
   return JSON.parse(readFileSync(join(process.cwd(), relativePath), "utf8")) as T;
@@ -114,6 +138,97 @@ interface ContractCall {
   args: xdr.ScVal[];
 }
 
+/** `ValidationOutcome::Invalid(rule)` — SPEC §8.1's enum over the wire. */
+function invalidOutcome(rule: string): xdr.ScVal {
+  return xdr.ScVal.scvVec([
+    xdr.ScVal.scvSymbol("Invalid"),
+    xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(rule)]),
+  ]);
+}
+
+/** `ValidationOutcome::Valid`. */
+const VALID_OUTCOME = xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("Valid")]);
+
+const MAX_LIST_ENTRIES = 256;
+const MAX_WINDOW_SECS = 315_360_000;
+
+/**
+ * A subset of the contract's §8 validation, for `validate_policy` (issue #259).
+ *
+ * The rules are the ones a form-built config can reach while still passing the
+ * dashboard's own local checks — evaluated in SPEC §8.1 order, like the
+ * contract's `validate_policy`, so the preflight reports the *first* failure.
+ * This is a test double, not a second implementation of §8: rules the form
+ * cannot produce from its fields are left out rather than approximated.
+ */
+function validationOutcome(contract: string, configScVal: xdr.ScVal): xdr.ScVal {
+  let config: Record<string, unknown>;
+  try {
+    config = scValToNative(configScVal) as Record<string, unknown>;
+  } catch {
+    // An undecodable config can never be a valid config.
+    return invalidOutcome("AmountSign");
+  }
+  const big = (value: unknown): bigint =>
+    typeof value === "bigint" ? value : BigInt((value as string | number | undefined) ?? 0);
+  const list = (key: string): unknown[] => (config[key] as unknown[] | undefined) ?? [];
+  const strings = (key: string): string[] => list(key).map((item) => String(item));
+  const hasDuplicate = (values: string[]): boolean => new Set(values).size !== values.length;
+
+  if (strings("assets").length > MAX_LIST_ENTRIES) return invalidOutcome("AssetListTooLong");
+  if (list("protocols").length > MAX_LIST_ENTRIES) return invalidOutcome("ProtocolListTooLong");
+  if (strings("recipients").length > MAX_LIST_ENTRIES)
+    return invalidOutcome("RecipientListTooLong");
+
+  if (big(config.per_tx_cap) < 0n || big(config.window_cap) < 0n)
+    return invalidOutcome("AmountSign");
+
+  const windowSecs = big(config.window_secs);
+  const recipientCaps = list("recipient_window_caps") as Array<{ cap?: unknown }>;
+  if (
+    (big(config.window_cap) !== 0n || recipientCaps.some((row) => big(row.cap) > 0n)) &&
+    windowSecs === 0n
+  )
+    return invalidOutcome("WindowRequiresWidth");
+
+  const activeFrom = big(config.active_from);
+  const activeUntil = big(config.active_until);
+  if (activeUntil !== 0n && activeUntil <= activeFrom) return invalidOutcome("ActiveWindowOrder");
+
+  const addressLists = ["assets", "recipients", "blocked_recipients"].map(strings);
+  if (
+    addressLists.some((values) => values.includes(contract)) ||
+    list("protocols").some(
+      (rule) => String((rule as { contract?: unknown }).contract) === contract,
+    ) ||
+    recipientCaps.some((row) => String((row as { recipient?: unknown }).recipient) === contract)
+  )
+    return invalidOutcome("SelfAddressInList");
+
+  if (addressLists.some(hasDuplicate)) return invalidOutcome("DuplicateAddressInList");
+
+  const protocolContracts = list("protocols").map((rule) =>
+    String((rule as { contract?: unknown }).contract),
+  );
+  if (hasDuplicate(protocolContracts)) return invalidOutcome("ProtocolContractDuplicate");
+
+  for (const rule of list("protocols") as Array<{ fns?: string[] | null }>) {
+    const fns = rule.fns ?? null;
+    if (fns !== null && (fns.length === 0 || hasDuplicate(fns.map(String))))
+      return invalidOutcome("ProtocolFnListInvalid");
+  }
+
+  const perTxCap = big(config.per_tx_cap);
+  const windowCap = big(config.window_cap);
+  if (perTxCap > 0n && windowCap > 0n && perTxCap > windowCap)
+    return invalidOutcome("PerTxCapExceedsWindowCap");
+
+  if (windowSecs > BigInt(MAX_WINDOW_SECS) || big(config.dms_grace_secs) > BigInt(MAX_WINDOW_SECS))
+    return invalidOutcome("DurationExceedsBound");
+
+  return VALID_OUTCOME;
+}
+
 function decodeCall(transactionXdr: string): ContractCall | null {
   const tx = TransactionBuilder.fromXDR(transactionXdr, NETWORK.passphrase);
   const envelope = tx.toEnvelope();
@@ -137,6 +252,21 @@ function decodeCall(transactionXdr: string): ContractCall | null {
   return null;
 }
 
+/** The same module with one byte flipped: right length, wrong hash. */
+function withFlippedByte(bytes: Uint8Array): Uint8Array {
+  const copy = bytes.slice();
+  const last = copy.length - 1;
+  copy[last] = (copy[last] ?? 0) ^ 0xff;
+  return copy;
+}
+
+/** The same module with a tail: wrong length, and a different hash too. */
+function withExtraBytes(bytes: Uint8Array, extra: number): Uint8Array {
+  const copy = new Uint8Array(bytes.length + extra);
+  copy.set(bytes);
+  return copy;
+}
+
 export class SorobanRpcMock {
   /** Every JSON-RPC method the page has asked for, in order (debug aid). */
   readonly requests: string[] = [];
@@ -144,9 +274,18 @@ export class SorobanRpcMock {
   deliveredEvents = 0;
   /** Contracts created/frozen/… during the test, keyed by address. */
   readonly guards = new Map<string, GuardState>();
+  /**
+   * Which artifact this chain serves. Public so a spec can flip it mid-test —
+   * mismatched, then valid again — without reloading the page, which is exactly
+   * the recovery the deploy panel has to demonstrate (issue #351).
+   */
+  artifactMode: ArtifactMode;
+
+  private readonly contractInstances = new Set<string>([PHASE1_ARTIFACT.guard]);
 
   private readonly capture: RpcCapture;
   private readonly wasm: Uint8Array;
+  private readonly artifacts = new Map<ArtifactMode, { bytes: Uint8Array; hash: string }>();
   private readonly encodedEvents: EncodedEvent[];
   private readonly eventBatchSize: number | null;
   private readonly transactions = new Map<string, string>();
@@ -160,6 +299,7 @@ export class SorobanRpcMock {
     this.capture = readJsonFixture<RpcCapture>("tests/fixtures/rpc-capture.json");
     this.latestLedger = this.capture.sequence;
     this.eventBatchSize = options.eventBatchSize ?? null;
+    this.artifactMode = options.artifact ?? "pinned";
 
     this.wasm = new Uint8Array(
       readFileSync(join(process.cwd(), "tests/fixtures/phase1-artifact.wasm")),
@@ -170,6 +310,7 @@ export class SorobanRpcMock {
         `tests/fixtures/phase1-artifact.wasm does not match the pinned artifact (${digest}, ${this.wasm.length} bytes)`,
       );
     }
+    this.artifacts.set("pinned", { bytes: this.wasm, hash: digest });
 
     this.encodedEvents = (options.events ?? []).map((spec) => ({
       ledger: spec.ledger,
@@ -194,6 +335,25 @@ export class SorobanRpcMock {
         sorobanMeta: null,
       }),
     ).toXDR("base64");
+  }
+
+  /**
+   * The bytes this chain serves as the Phase 1 artifact, with the hash the
+   * ledger declares for them (issue #351).
+   *
+   * Derived once per mode and reused, so a spec that flips the mode back gets
+   * byte-identical answers rather than a new random mismatch.
+   */
+  private activeArtifact(): { bytes: Uint8Array; hash: string } {
+    const known = this.artifacts.get(this.artifactMode);
+    if (known) return known;
+    const bytes =
+      this.artifactMode === "length-mismatch"
+        ? withExtraBytes(this.wasm, 8)
+        : withFlippedByte(this.wasm);
+    const derived = { bytes, hash: createHash("sha256").update(bytes).digest("hex") };
+    this.artifacts.set(this.artifactMode, derived);
+    return derived;
   }
 
   /** How many `getEvents` pages the mock has served so far. */
@@ -226,7 +386,7 @@ export class SorobanRpcMock {
     const method = body?.method ?? "unknown";
     this.requests.push(method);
     try {
-      const result = this.dispatch(method, body?.params ?? ({} as never));
+      const result = await this.dispatch(method, body?.params ?? ({} as never));
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -256,7 +416,7 @@ export class SorobanRpcMock {
     };
   }
 
-  private dispatch(method: string, params: Record<string, unknown>): unknown {
+  private async dispatch(method: string, params: Record<string, unknown>): Promise<unknown> {
     switch (method) {
       case "getHealth":
         return { status: "healthy", ...this.ledgerFields() };
@@ -281,7 +441,7 @@ export class SorobanRpcMock {
       case "simulateTransaction":
         return this.simulate(String(params["transaction"] ?? ""));
       case "sendTransaction":
-        return this.sendTransaction(String(params["transaction"] ?? ""));
+        return await this.sendTransaction(String(params["transaction"] ?? ""));
       case "getTransaction":
         return this.getTransaction(String(params["hash"] ?? ""));
       case "getEvents":
@@ -317,12 +477,13 @@ export class SorobanRpcMock {
     }
 
     if (key.type === "contractCode") {
+      const active = this.activeArtifact();
       const requested = hashToHex(key.contractCode.hash);
-      if (requested !== PHASE1_ARTIFACT.wasmHash) return null;
+      if (requested !== active.hash) return null;
       const entry = new xdr.ContractCodeEntry({
         ext: xdr.ContractCodeEntryExt.v0(),
-        hash: new Uint8Array(Buffer.from(PHASE1_ARTIFACT.wasmHash, "hex")),
-        code: this.wasm,
+        hash: new Uint8Array(Buffer.from(active.hash, "hex")),
+        code: active.bytes,
       });
       return {
         key: keyB64,
@@ -337,6 +498,9 @@ export class SorobanRpcMock {
       // Storage reads (the rolling `Window`, policy slots, …) resolve to "no
       // entry": the console renders that as an absent window, never as a zero.
       if (data.key.type === "scvVec") return null;
+      if (data.key.type !== "scvLedgerKeyContractInstance") return null;
+      const contractId = Address.fromScAddress(data.contract).toString();
+      if (!this.contractInstances.has(contractId)) return null;
       // The instance lookup: every guard in these tests runs the pinned
       // artifact, which is what the deploy flow re-verifies after creation.
       const instance = new xdr.ContractDataEntry({
@@ -347,7 +511,7 @@ export class SorobanRpcMock {
         val: xdr.ScVal.scvContractInstance(
           new xdr.ScContractInstance({
             executable: xdr.ContractExecutable.contractExecutableWasm(
-              new Uint8Array(Buffer.from(PHASE1_ARTIFACT.wasmHash, "hex")),
+              new Uint8Array(Buffer.from(this.activeArtifact().hash, "hex")),
             ),
             storage: [],
           }),
@@ -380,6 +544,8 @@ export class SorobanRpcMock {
       });
     } else if (call?.fn === "policy") {
       retval = this.guard(call.contract).policy ?? xdr.ScVal.scvVoid();
+    } else if (call?.fn === "validate_policy") {
+      retval = validationOutcome(call.contract, call.args[0] ?? xdr.ScVal.scvVoid());
     }
 
     return {
@@ -391,10 +557,16 @@ export class SorobanRpcMock {
     };
   }
 
-  private sendTransaction(transactionXdr: string): Record<string, unknown> {
+  private async sendTransaction(transactionXdr: string): Promise<Record<string, unknown>> {
     const hash = createHash("sha256").update(Buffer.from(transactionXdr, "base64")).digest("hex");
     this.transactions.set(hash, transactionXdr);
     this.latestLedger += 1;
+
+    const createdContract = await this.createdContractId(transactionXdr);
+    if (createdContract) {
+      this.contractInstances.add(createdContract);
+      this.guards.set(createdContract, { frozen: false, policy: null });
+    }
 
     // Apply the call's effect — the mock's version of consensus.
     const call = decodeCall(transactionXdr);
@@ -419,6 +591,26 @@ export class SorobanRpcMock {
     }
 
     return { status: "PENDING", hash, ...this.ledgerFields() };
+  }
+
+  private async createdContractId(transactionXdr: string): Promise<string | null> {
+    const transaction = TransactionBuilder.fromXDR(transactionXdr, NETWORK.passphrase);
+    const envelope = transaction.toEnvelope();
+    if (envelope.type !== "envelopeTypeTx") return null;
+    for (const operation of envelope.v1.tx.operations) {
+      const body = operation.body;
+      if (body.type !== "invokeHostFunction") continue;
+      const hostFunction = body.invokeHostFunctionOp.hostFunction;
+      if (hostFunction.type !== "hostFunctionTypeCreateContractV2") continue;
+      const preimage = hostFunction.createContractV2.contractIdPreimage;
+      if (preimage.type !== "contractIdPreimageFromAddress") continue;
+      const deployer = Address.fromScAddress(preimage.fromAddress.address).toString();
+      return await predictContractId({
+        deployerPublicKey: deployer,
+        salt: preimage.fromAddress.salt.value,
+      });
+    }
+    return null;
   }
 
   private getTransaction(hash: string): Record<string, unknown> {

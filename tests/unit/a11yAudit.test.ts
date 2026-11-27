@@ -7,10 +7,13 @@ import { installDom, loadReact, sleep, type Act } from "./domHarness.ts";
 import { PolicyForm } from "../../components/PolicyForm.tsx";
 import { PanicPanel } from "../../components/PanicPanel.tsx";
 import { DeployPanel } from "../../components/DeployPanel.tsx";
+import { SetupWizard } from "../../components/SetupWizard.tsx";
 import { StatusPanel } from "../../components/StatusPanel.tsx";
 import { TxHistoryTable } from "../../components/TxHistoryTable.tsx";
 import { TelemetryFeed } from "../../components/TelemetryFeed.tsx";
+import { TelemetryChart } from "../../components/TelemetryChart.tsx";
 import { GuardContext, GuardEventsContext } from "../../components/GuardProvider.tsx";
+import { POLL_OFF } from "../../lib/guard/feedHealth.ts";
 import { TX_HISTORY_STORAGE_KEY, type TxHistoryEntry } from "../../lib/guard/txHistory.ts";
 import type { GuardSnapshot } from "../../lib/guard/guardOps.ts";
 
@@ -45,7 +48,11 @@ const noNetworkServer = new Proxy(
 const TEST_GUARD = {
   server: noNetworkServer,
   wallet: {
-    address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWH",
+    // A real strkey, not a placeholder: the freeze dialog reads its pre-signature
+    // authorization summary (#343) out of this account, and an address the SDK cannot
+    // parse makes that summary impossible, which disables the acknowledgement the
+    // keyboard walk below depends on being able to tick.
+    address: "GAOBCRXTCO4ZCBNHALJUMJJ5JDXNOUZ7U6VZJX4UBTXAHQEO66IPU6PH",
     networkPassphrase: "Test SDF Network ; September 2015",
     network: "Testnet",
   },
@@ -57,16 +64,31 @@ const TEST_GUARD = {
     throw new Error("no signing in a11y tests");
   },
   instances: [],
-  guard: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  guard: "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7",
   selectGuard: () => {},
   addInstance: () => {},
   snapshot: null,
   snapshotError: null,
   refreshing: false,
   refresh: async () => {},
-  feed: { watching: false, latestLedger: null, error: null, lastPolledAt: null },
+  feed: {
+    watching: false,
+    latestLedger: null,
+    error: null,
+    lastPolledAt: null,
+    guards: [],
+    capped: 0,
+    cappedLabels: [],
+    health: POLL_OFF,
+    gaps: [],
+    failures: [],
+    refresh: async () => null,
+  },
   startWatching: () => {},
   stopWatching: () => {},
+  tailSelection: [],
+  toggleTailedGuard: () => {},
+  exportRange: null,
   stream: { paused: false, pendingCount: 0, dropped: 0 },
   pauseStream: () => {},
   resumeStream: () => {},
@@ -183,6 +205,15 @@ test("the freeze confirmation dialog passes axe-core while open", async () => {
   }
 });
 
+test("SetupWizard passes automated axe-core WCAG 2.1 AA checks", async () => {
+  window.localStorage.removeItem("stellar-agent-guard-dashboard.setup-wizard.v1");
+  try {
+    await assertCleanScan(renderGuarded(react.createElement(SetupWizard)), "SetupWizard");
+  } finally {
+    window.localStorage.removeItem("stellar-agent-guard-dashboard.setup-wizard.v1");
+  }
+});
+
 test("StatusPanel passes axe-core with the default-deny banner showing", async () => {
   // The banner is the loudest thing this interface ever renders, so it is
   // scanned in the state that makes it appear (issue #25).
@@ -221,6 +252,69 @@ test("StatusPanel passes axe-core with the default-deny banner showing", async (
     );
     const violations = await axeViolations(rendered.container);
     assert.deepEqual(violations, [], "the default-deny banner must pass axe-core");
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("StatusPanel passes axe-core in the error state and still links its help (#531)", async () => {
+  // A failed snapshot is when an operator most needs to know what the panel
+  // means and what to do next, so the help links must survive the error state.
+  const context = { ...TEST_GUARD, snapshot: null, snapshotError: "RPC unreachable" };
+  const rendered = await renderPanel(
+    react.createElement(
+      GuardContext.Provider,
+      { value: context },
+      react.createElement(StatusPanel),
+    ),
+  );
+  try {
+    const help = rendered.container.querySelector('nav[aria-label="Status panel help"]');
+    assert.ok(help, "the status panel help links render in the error state");
+    const names = Array.from(help.querySelectorAll("a")).map((a) => a.textContent);
+    assert.deepEqual(names, [
+      "How to read this panel",
+      "What the guard enforces",
+      "Incident runbook",
+    ]);
+    const violations = await axeViolations(rendered.container);
+    assert.deepEqual(violations, [], "the error state with help links must pass axe-core");
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("the policy review dialog passes axe-core while open (#537, #540)", async () => {
+  const { PolicyDiffModal } = await import("../../components/PolicyDiffModal.tsx");
+  const { computePolicyDiff } = await import("../../lib/guard/policyDiff.ts");
+  const base = {
+    per_tx_cap: 100n,
+    window_secs: 86400n,
+    window_cap: 1000n,
+    assets: [],
+    protocols: [],
+    recipients: [],
+    allow_any_recipient: false,
+    active_from: 0n,
+    active_until: 0n,
+    paused: false,
+    dms_grace_secs: 0n,
+  };
+  const diff = computePolicyDiff(base, { ...base, per_tx_cap: 5n, window_cap: 50n });
+  const rendered = await renderPanel(
+    react.createElement(PolicyDiffModal, {
+      diff,
+      authorization: null,
+      onConfirm: () => {},
+      onCancel: () => {},
+    }),
+  );
+  try {
+    const dialog = rendered.container.querySelector<HTMLElement>('[role="dialog"]');
+    assert.ok(dialog);
+    assert.equal(document.activeElement, dialog, "focus moved into the review dialog");
+    const violations = await axeViolations(rendered.container);
+    assert.deepEqual(violations, [], "the open policy review must pass axe-core");
   } finally {
     await rendered.unmount();
   }
@@ -292,22 +386,78 @@ test("TelemetryFeed passes axe-core with severity tiers on every row kind", asyn
   }
 });
 
+test("the telemetry chart passes axe-core and keeps its data view reachable", async () => {
+  // Issue #532: a chart can be structurally clean while its trends are still
+  // unavailable to a screen reader, so the populated chart is scanned *and* the
+  // alternate view is proven to be a labelled, focusable table.
+  const events = [
+    {
+      kind: "auth_checked",
+      topic: "event_auth_checked",
+      source: "diagnostic",
+      contractId: TEST_GUARD.guard,
+      ledger: null,
+      ledgerClosedAt: null,
+      transactionHash: null,
+      decision: { result: "blocked", reason: "per_tx_cap_exceeded" },
+      data: {},
+    },
+  ] as GuardEventsContextValue;
+  const rendered = await renderPanel(
+    react.createElement(
+      GuardContext.Provider,
+      { value: TEST_GUARD },
+      react.createElement(
+        GuardEventsContext.Provider,
+        { value: events },
+        react.createElement(TelemetryChart),
+      ),
+    ),
+  );
+  try {
+    const toggle = rendered.container.querySelector<HTMLButtonElement>(
+      '[data-testid="tchart-data-toggle"]',
+    );
+    assert.ok(toggle, "the non-visual route into the data must exist");
+    await act(async () => toggle.click());
+
+    const table = rendered.container.querySelector("table.chart-data");
+    assert.ok(table, "the alternate view is a real table");
+    assert.ok(table.querySelector("caption"), "the table carries the chart's summary");
+    assert.equal(
+      rendered.container.querySelector('[data-testid="tchart-data-view"]')?.getAttribute("role"),
+      "region",
+    );
+
+    const violations = await axeViolations(rendered.container);
+    assert.deepEqual(violations, [], "the chart and its data view must pass axe-core");
+  } finally {
+    await rendered.unmount();
+  }
+});
+
 test("TxHistoryTable passes automated axe-core WCAG 2.1 AA checks", async () => {
   // Seed the store so the scan sees the populated table, not just empty state.
+  // The timestamps are relative to now: loadTxHistory prunes records older than
+  // TX_HISTORY_MAX_AGE_DAYS, so a fixed date would eventually seed nothing.
   const seeded: TxHistoryEntry[] = [
     {
       hash: "abc123def456",
       operation: "set_policy",
       status: "confirmed",
       feeStroops: "310",
-      recordedAt: "2026-09-24T10:00:00.000Z",
+      networkName: null,
+      networkPassphrase: null,
+      recordedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
     },
     {
       hash: "789xyz012345",
       operation: "freeze",
       status: "failed",
       feeStroops: "100",
-      recordedAt: "2026-09-23T09:30:00.000Z",
+      networkName: null,
+      networkPassphrase: null,
+      recordedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
     },
   ];
   window.localStorage.setItem(TX_HISTORY_STORAGE_KEY, JSON.stringify(seeded));

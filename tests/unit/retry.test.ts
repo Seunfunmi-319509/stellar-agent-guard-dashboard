@@ -1,6 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { RetryableError, withBackoff } from "../../lib/guard/retry.ts";
+import {
+  AmbiguousSubmissionError,
+  RetryableError,
+  ValidationError,
+  WalletCancellationError,
+  classifyFailure,
+  isWalletCancellation,
+  retryAllowed,
+  withBackoff,
+  type FailureCategory,
+  type OperationSafety,
+  type RetryWait,
+} from "../../lib/guard/retry.ts";
+import { MAX_RETRY_AFTER_MS, parseRetryAfter } from "../../lib/rpc/backoff.ts";
 
 /**
  * Runs `operation` with `setTimeout` and `Math.random` stubbed so the backoff
@@ -106,4 +119,275 @@ test("rethrows after exhausting maxRetries", async () => {
     /NOT_FOUND/,
   );
   assert.equal(calls, 3, "one initial attempt plus maxRetries retries");
+});
+
+// ── Provider retry hints (#345) ────────────────────────────────────────────
+
+/** A rate-limited RPC failure, shaped the way the SDK surfaces it. */
+function rateLimited(headers: Record<string, string>): Error {
+  const error = new Error("RPC responded 429 Too Many Requests") as Error & {
+    status: number;
+    headers: Record<string, string>;
+  };
+  error.status = 429;
+  error.headers = headers;
+  return error;
+}
+
+/** Runs a read that fails once with `failure`, capturing the waits it took. */
+async function captureHintDelays(
+  failure: Error,
+  options: { maxRetries?: number; baseDelayMs?: number; maxRetryAfterMs?: number } = {},
+): Promise<number[]> {
+  let calls = 0;
+  return captureDelays(1, () =>
+    withBackoff(
+      async () => {
+        calls += 1;
+        if (calls === 1) throw failure;
+        return "ok";
+      },
+      { baseDelayMs: 400, ...options },
+    ),
+  );
+}
+
+test("parses both supported Retry-After formats and rejects the rest", () => {
+  const now = Date.parse("2026-10-21T08:00:00Z");
+  assert.equal(parseRetryAfter("7", now), 7000, "delta-seconds");
+  assert.equal(parseRetryAfter(7, now), 7000, "a numeric delta");
+  assert.equal(
+    parseRetryAfter("Wed, 21 Oct 2026 08:00:05 GMT", now),
+    5000,
+    "an HTTP-date is measured from now",
+  );
+  assert.equal(parseRetryAfter("soon", now), null, "malformed text is not a hint");
+  assert.equal(parseRetryAfter("Wed, 21 Oct 2026 07:59:00 GMT", now), null, "a past date is stale");
+  assert.equal(parseRetryAfter("0", now), null, "a zero delta would be a retry loop, not a wait");
+  assert.equal(parseRetryAfter(undefined, now), null);
+});
+
+test("honours a delta-seconds hint for a rate-limited read", async () => {
+  const delays = await captureHintDelays(rateLimited({ "retry-after": "7" }));
+  assert.deepEqual(delays, [7000], "the provider's wait replaces the client's backoff");
+});
+
+test("honours an HTTP-date hint", async () => {
+  const retryAt = new Date(Date.now() + 5000).toUTCString();
+  const delays = await captureHintDelays(rateLimited({ "retry-after": retryAt }), {
+    maxRetryAfterMs: 60_000,
+  });
+  assert.equal(delays.length, 1);
+  const first = delays[0];
+  assert.ok(first !== undefined, "one wait was captured");
+  assert.ok(first > 3000 && first <= 5000, `the wait should be about five seconds, got ${first}`);
+});
+
+test("clamps an excessive hint to the documented maximum", async () => {
+  const delays = await captureHintDelays(rateLimited({ "retry-after": "3600" }));
+  assert.deepEqual(delays, [MAX_RETRY_AFTER_MS], "an hour becomes the 30 s ceiling");
+
+  const waits: RetryWait[] = [];
+  await captureDelays(1, () =>
+    withBackoff(
+      async () => {
+        throw rateLimited({ "retry-after": "3600" });
+      },
+      { maxRetries: 1, maxRetryAfterMs: 2000, onWait: (wait) => waits.push(wait) },
+    ).catch(() => undefined),
+  );
+  assert.equal(waits[0]?.delayMs, 2000, "a caller can lower the ceiling");
+  assert.equal(waits[0]?.requestedMs, 3_600_000);
+  assert.equal(waits[0]?.clamped, true);
+});
+
+test("ignores malformed and past hints, falling back to backoff", async () => {
+  assert.deepEqual(await captureHintDelays(rateLimited({ "retry-after": "soon" })), [400]);
+  const past = new Date(Date.now() - 60_000).toUTCString();
+  assert.deepEqual(await captureHintDelays(rateLimited({ "retry-after": past })), [400]);
+});
+
+test("applies a hint only to rate-limited failures", async () => {
+  const timeout = new Error("RPC TIMEOUT") as Error & { headers: Record<string, string> };
+  timeout.headers = { "retry-after": "7" };
+  assert.deepEqual(
+    await captureHintDelays(timeout),
+    [400],
+    "a Retry-After on a timeout is not a hint about that timeout",
+  );
+});
+
+test("reports each wait so the operator can be told why the read paused", async () => {
+  const waits: RetryWait[] = [];
+  await captureDelays(1, () =>
+    withBackoff(
+      async () => {
+        if (waits.length === 0) throw rateLimited({ "retry-after": "3" });
+        return "ok";
+      },
+      { maxRetries: 2, onWait: (wait) => waits.push(wait) },
+    ),
+  );
+  assert.deepEqual(waits, [
+    { attempt: 0, delayMs: 3000, source: "retry-after", requestedMs: 3000, clamped: false },
+  ]);
+});
+
+test("a cancellation aborts a pending wait instead of retrying", async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      withBackoff(
+        async () => {
+          calls += 1;
+          throw rateLimited({ "retry-after": "5" });
+        },
+        { maxRetries: 3, onWait: () => controller.abort(), signal: controller.signal },
+      ),
+    /abort/i,
+  );
+  assert.equal(calls, 1, "no further attempt is made after cancellation");
+});
+
+// ── Typed failure categories, and what may be retried (#344) ───────────────
+
+/** A wallet adapter error of the shape `lib/guard/wallet.ts` produces. */
+function walletError(message: string): Error {
+  const error = new Error(message);
+  error.name = "WalletError";
+  return error;
+}
+
+/** The connector's already-classified refusal, by name rather than by wording. */
+function connectorRejection(): Error {
+  const error = new Error("You declined to sign in Freighter. Nothing was sent.");
+  error.name = "WalletUserRejectedError";
+  return error;
+}
+
+test("every failure the write path can meet lands in exactly one category", () => {
+  assert.equal(classifyFailure(new RetryableError("RPC TIMEOUT")), "retryable-read");
+  assert.equal(classifyFailure(new ValidationError("Invalid contract id")), "validation");
+  assert.equal(
+    classifyFailure(new WalletCancellationError("You declined to sign the transaction.")),
+    "wallet-cancellation",
+  );
+  assert.equal(
+    classifyFailure(new AmbiguousSubmissionError("the broadcast did not answer", "aabb")),
+    "ambiguous-submission",
+  );
+  assert.equal(classifyFailure(new Error("something nobody has seen before")), "unclassified");
+});
+
+test("a cancellation is recognised from a wallet, not from any error that says rejected", () => {
+  assert.equal(
+    classifyFailure(walletError("signTransaction failed in the wallet: User rejected the request")),
+    "wallet-cancellation",
+    "the bare Freighter adapter reports the decline inside a generic WalletError",
+  );
+  assert.equal(classifyFailure(connectorRejection()), "wallet-cancellation");
+  assert.ok(isWalletCancellation(connectorRejection()));
+  assert.equal(
+    classifyFailure(new Error("the network rejected the transaction")),
+    "unclassified",
+    '"rejected" by itself is the network talking, not the operator — the two need opposite repairs',
+  );
+  assert.equal(
+    isWalletCancellation(new Error("Invalid contract id")),
+    false,
+    "a validation failure is never a cancellation",
+  );
+});
+
+test("a not-found is transient only when the caller says so", () => {
+  assert.equal(classifyFailure(new Error("RPC TIMEOUT")), "retryable-read");
+  assert.equal(classifyFailure(new Error("TRY_AGAIN_LATER")), "retryable-read");
+  assert.equal(classifyFailure(rateLimited({})), "retryable-read");
+  assert.equal(
+    classifyFailure(new Error("Contract NOT_FOUND")),
+    "unclassified",
+    "an unfounded contract is a definitive state; retrying it repeats the same answer",
+  );
+  assert.equal(
+    classifyFailure(new RetryableError("NOT_FOUND")),
+    "retryable-read",
+    "the inclusion poll types its own in-flight miss, which genuinely is transient",
+  );
+});
+
+test("retryAllowed is the whole rule: a transient failure on an operation that changes nothing", () => {
+  const categories: FailureCategory[] = [
+    "retryable-read",
+    "validation",
+    "wallet-cancellation",
+    "ambiguous-submission",
+    "unclassified",
+  ];
+  const safeties: OperationSafety[] = ["idempotent-read", "write"];
+  const allowed: string[] = [];
+  for (const safety of safeties) {
+    for (const category of categories) {
+      if (retryAllowed(category, safety)) allowed.push(`${category}/${safety}`);
+    }
+  }
+  assert.deepEqual(
+    allowed,
+    ["retryable-read/idempotent-read"],
+    "exactly one of the ten combinations may repeat",
+  );
+});
+
+test("a write is attempted exactly once even when it failed like a retryable read", async () => {
+  let calls = 0;
+  const delays = await captureDelays(1, () =>
+    assert.rejects(
+      () =>
+        withBackoff(
+          async () => {
+            calls += 1;
+            throw new RetryableError("RPC TIMEOUT");
+          },
+          { maxRetries: 5, baseDelayMs: 10, safety: "write" },
+        ),
+      /RPC TIMEOUT/,
+    ),
+  );
+  assert.equal(calls, 1, "the timeout is exactly the case a read would retry");
+  assert.deepEqual(delays, [], "and not one wait was scheduled");
+});
+
+test("an untyped not-found no longer triggers the retry loop it used to", async () => {
+  let calls = 0;
+  const delays = await captureDelays(1, () =>
+    assert.rejects(
+      () =>
+        withBackoff(
+          async () => {
+            calls += 1;
+            throw new Error("Contract NOT_FOUND");
+          },
+          { maxRetries: 3, baseDelayMs: 10 },
+        ),
+      /NOT_FOUND/,
+    ),
+  );
+  assert.equal(calls, 1, "it is classified as whatever it is, not as a transient read");
+  assert.deepEqual(delays, []);
+});
+
+test("a read still gets its bounded, capped retries — the safety is not a downgrade", async () => {
+  let calls = 0;
+  const delays = await captureDelays(1, () =>
+    withBackoff(
+      async () => {
+        calls += 1;
+        if (calls < 4) throw new RetryableError("TRY_AGAIN_LATER");
+        return "landed";
+      },
+      { maxRetries: 3, baseDelayMs: 100, maxDelayMs: 8000, safety: "idempotent-read" },
+    ),
+  );
+  assert.deepEqual(delays, [100, 200, 400], "three bounded waits, then the read succeeds");
+  assert.equal(calls, 4);
 });
