@@ -109,6 +109,13 @@ Field by field:
 | **Protocols**                       | `C…`, or `C…:swap,deposit` for a per-function allowlist                       | One per line. No colon = any function on that contract.                                     |
 | **Start paused**                    | Installs the policy but refuses every call until resumed                      | The safe way to stage a policy change.                                                      |
 
+Beside each optional field, the form now shows the **effective default** the
+contract applies when the field is blank or the toggle is off, with a link to the
+[contract validation rules and accepted-but-inert configurations](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/blob/main/SPEC.md#validation-rules-and-accepted-but-inert-configurations).
+Read those notes as part of staging: an empty asset list is a transfer lock, an
+empty protocol list blocks external calls, and blank caps are disabled rather
+than unlimited-but-still-metered.
+
 Two behaviours worth knowing:
 
 - **`Load installed`** discards your edits and re-reads the chain, so you can start
@@ -136,6 +143,16 @@ unintended edit — use `Load installed` and start again.
 
 The console validates the draft locally and lists every problem **before** Freighter
 is ever prompted. The submit button stays disabled while any issue remains.
+
+A per-field summary appears **before** the `Review` line. Each problem is linked to
+the field that caused it; selecting a link moves focus to that input, reveals the
+same inline error message, and announces the field and message to screen readers.
+The full list stays visible until every issue is fixed.
+
+Imported JSON and presets use the same validation gate as hand-edited drafts. An
+export file with a malformed identifier, unknown version, wrong network, a cap past
+the `i128` boundary, or a cross-field error such as a rolling cap with a blank
+window is refused before it can be staged for signing.
 
 Validation rules you will hit:
 
@@ -208,16 +225,19 @@ Tick every box that applies before signing.
 ## 7. Submit
 
 1. Confirm the `Review` line one more time.
-2. Click **Sign and install policy**. Freighter prompts for signature. If any
-   address is on the warning registry, the warning modal opens first and nothing
-   reaches the wallet until you clear both gates.
-3. The panel reports one of three outcomes — read which one:
+2. Click **Sign and install policy**. Freighter prompts for signature.
+3. The panel reports one of four outcomes — read which one:
    - **Landed on chain** — a `set_policy` transaction hash and ledger are shown. The
      receipt proves the write; it does not prove the policy is what you meant.
    - **Refused during simulation** — nothing was broadcast and nothing was paid.
      The detail names the stage. Fix and re-submit.
    - **Broadcast but rejected on chain** — a hash is shown and the transaction was
      included and rejected. The fee was spent. The detail explains why.
+   - **Broadcast, never answered** — the console sent the transaction and the network
+     fell silent, so whether the policy changed is **unknown**, not failed. The hash is
+     shown anyway. Resolve it from the chain — section 8, or the explorer — before
+     signing the same change again: a second send does not retry the first one, it puts
+     a second write on the network. Nothing here re-broadcasts on its own.
 4. Any refused-decision diagnostics are pushed into the telemetry feed as
    **diagnostic** rows, labelled as such — they are local evidence of a refusal, not
    ledger history.
@@ -327,7 +347,9 @@ For every policy update, record:
 
 The console's transaction history panel keeps a local record of this console's own
 writes, exportable as CSV or JSON — but it is **local to the browser profile**. Export
-it to durable storage whenever the change must remain auditable.
+it to durable storage whenever the change must remain auditable. If the profile is
+lost before the export, the local record is gone; [Lost browser profile
+recovery](./lost-browser-profile.md) lists what can and cannot be restored.
 
 ---
 

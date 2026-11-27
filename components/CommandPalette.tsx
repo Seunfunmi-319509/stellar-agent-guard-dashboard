@@ -4,6 +4,8 @@ import React, { useEffect, useState, useRef, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { useGuard } from "./GuardProvider.tsx";
 import { fuzzyMatch, type CommandAction } from "../lib/guard/commands.ts";
+import { useAnnounce } from "../lib/guard/useAnnounce.ts";
+import { helpHref } from "../lib/guard/helpLinks.ts";
 
 export function CommandPaletteInner({
   router,
@@ -21,6 +23,11 @@ export function CommandPaletteInner({
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
+  // The control that held focus when the palette opened. Closing the palette
+  // (Escape, Ctrl/Cmd+K again, a backdrop click, or running a command) returns
+  // focus there, so a keyboard user is not dropped at the top of the page.
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const announce = useAnnounce();
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
@@ -34,12 +41,20 @@ export function CommandPaletteInner({
   }, []);
 
   useEffect(() => {
-    if (open) {
-      inputRef.current?.focus();
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setQuery("");
-      setActiveIndex(0);
-    }
+    if (!open) return;
+    const active = document.activeElement as HTMLElement | null;
+    returnFocusRef.current = active && active !== document.body ? active : null;
+    inputRef.current?.focus();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setQuery("");
+    setActiveIndex(0);
+    return () => {
+      const target = returnFocusRef.current;
+      returnFocusRef.current = null;
+      // A command may have navigated or re-rendered the page; only a control
+      // still in the document can take focus back.
+      if (target?.isConnected) target.focus();
+    };
   }, [open]);
 
   const commands = useMemo(() => {
@@ -62,6 +77,12 @@ export function CommandPaletteInner({
         category: "Docs",
         action: () =>
           window.open("https://github.com/aigbagbobila/stellar-agent-guard-sdk", "_blank"),
+      },
+      {
+        id: "doc-keyboard",
+        name: "Keyboard & Screen-Reader Guide",
+        category: "Docs",
+        action: () => window.open(helpHref("keyboard"), "_blank", "noopener,noreferrer"),
       },
     ];
 
@@ -91,11 +112,25 @@ export function CommandPaletteInner({
 
     return cmds.filter((c) => fuzzyMatch(query, c.name));
   }, [query, router, guard, instances, selectGuard]);
+  const selectedIndex =
+    commands.length === 0 ? -1 : Math.min(Math.max(activeIndex, 0), commands.length - 1);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setActiveIndex(0);
   }, [query, commands.length]);
+
+  useEffect(() => {
+    if (!open) return;
+    const timeout = window.setTimeout(() => {
+      announce(
+        commands.length === 0
+          ? "No commands found"
+          : `${commands.length} command${commands.length === 1 ? "" : "s"} available`,
+      );
+    }, 300);
+    return () => window.clearTimeout(timeout);
+  }, [announce, commands.length, open]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
@@ -103,25 +138,25 @@ export function CommandPaletteInner({
       setOpen(false);
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActiveIndex((i) => (i + 1) % commands.length);
+      if (commands.length > 0) setActiveIndex((i) => (i + 1) % commands.length);
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setActiveIndex((i) => (i - 1 + commands.length) % commands.length);
+      if (commands.length > 0) setActiveIndex((i) => (i - 1 + commands.length) % commands.length);
     } else if (e.key === "Enter") {
       e.preventDefault();
-      if (commands[activeIndex]) {
-        commands[activeIndex].action();
+      if (commands[selectedIndex]) {
+        commands[selectedIndex].action();
         setOpen(false);
       }
     }
   };
 
   useEffect(() => {
-    const activeEl = listRef.current?.children[activeIndex] as HTMLElement;
+    const activeEl = listRef.current?.children[selectedIndex] as HTMLElement;
     if (activeEl) {
       activeEl.scrollIntoView({ block: "nearest" });
     }
-  }, [activeIndex]);
+  }, [selectedIndex]);
 
   if (!open) return null;
 
@@ -129,6 +164,9 @@ export function CommandPaletteInner({
     <div className="modal-backdrop" onClick={() => setOpen(false)}>
       <div
         className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
         style={{ padding: 0, marginTop: "10vh", alignSelf: "flex-start", maxWidth: "600px" }}
         onClick={(e) => e.stopPropagation()}
       >
@@ -140,10 +178,12 @@ export function CommandPaletteInner({
             onKeyDown={handleKeyDown}
             placeholder="Search commands..."
             role="combobox"
+            aria-label="Search commands"
             aria-expanded={open}
             aria-controls="command-list"
+            aria-haspopup="listbox"
             aria-autocomplete="list"
-            aria-activedescendant={commands[activeIndex]?.id}
+            aria-activedescendant={commands[selectedIndex]?.id}
             style={{
               fontSize: "16px",
               padding: "12px",
@@ -158,6 +198,8 @@ export function CommandPaletteInner({
         <ul
           id="command-list"
           ref={listRef}
+          role="listbox"
+          aria-label="Command results"
           style={{
             listStyle: "none",
             padding: "0 0 12px 0",
@@ -170,11 +212,13 @@ export function CommandPaletteInner({
             <li
               key={cmd.id}
               id={cmd.id}
+              role="option"
+              aria-selected={i === selectedIndex}
               style={{
                 padding: "10px 16px",
                 cursor: "pointer",
-                background: i === activeIndex ? "var(--panel-2)" : "transparent",
-                color: i === activeIndex ? "var(--text)" : "var(--muted)",
+                background: i === selectedIndex ? "var(--panel-2)" : "transparent",
+                color: i === selectedIndex ? "var(--text)" : "var(--muted)",
               }}
               onClick={() => {
                 cmd.action();
@@ -197,9 +241,11 @@ export function CommandPaletteInner({
             </li>
           ))}
           {commands.length === 0 && (
-            <div style={{ padding: "16px", textAlign: "center", color: "var(--muted)" }}>
-              No commands found.
-            </div>
+            <li role="presentation">
+              <div style={{ padding: "16px", textAlign: "center", color: "var(--muted)" }}>
+                No commands found.
+              </div>
+            </li>
           )}
         </ul>
       </div>

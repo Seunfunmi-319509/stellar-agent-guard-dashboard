@@ -8,6 +8,8 @@
  */
 
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import {
   Account,
@@ -25,9 +27,12 @@ import {
   readPolicy,
   readStatus,
   readWindow,
+  validatePolicy,
   verifyWasmIdentity,
 } from "../../lib/guard/chain.ts";
 import { GuardFeed, refusedEventsFromDiagnostics } from "../../lib/guard/telemetry.ts";
+import { RPC_HEALTH_CAVEAT, describeRpcHealth } from "../../lib/guard/network.ts";
+import { probeRpcHealth, type RpcHealthResult } from "../../lib/rpc/timeouts.ts";
 import { MockSorobanRpc, type Invocation } from "../mocks/mockRpcServer.ts";
 import {
   MOCK_GENESIS_LEDGER,
@@ -112,8 +117,28 @@ describe("readContract / readStatus / readPolicy", () => {
     assert.match(!limited.ok ? limited.error : "", /429/);
 
     // …and the next poll, once the limiter lets go, succeeds.
-    mock.onSimulate({ fn: "status" }, simSuccess(xdr.ScVal.scvBool(true)));
-    assert.deepEqual(await readStatus(server, MOCK_GUARD), { ok: true, value: true });
+    mock.onSimulate(
+      { fn: "status" },
+      simSuccess(
+        guardStatusScVal({
+          admin_frozen: false,
+          has_policy: true,
+          heartbeat_expired: false,
+          last_heartbeat: 1_789_481_712,
+          now: 1_789_481_732,
+        }),
+      ),
+    );
+    assert.deepEqual(await readStatus(server, MOCK_GUARD), {
+      ok: true,
+      value: {
+        admin_frozen: false,
+        has_policy: true,
+        heartbeat_expired: false,
+        last_heartbeat: 1_789_481_712n,
+        now: 1_789_481_732n,
+      },
+    });
   });
 
   test("reads are simulated from the fallback source and carry pre-encoded args", async () => {
@@ -129,6 +154,72 @@ describe("readContract / readStatus / readPolicy", () => {
     assert.equal(seen.args.length, 1);
     assert.equal(seen.args[0]!.toXDR("base64"), arg.toXDR("base64"));
     assert.match(seen.source, /^G[A-Z2-7]{55}$/);
+  });
+});
+
+describe("validatePolicy", () => {
+  test("sends the candidate config verbatim and decodes the failing rule", async () => {
+    let call: Invocation | null = null;
+    mock.onSimulate({ contractId: MOCK_GUARD, fn: "validate_policy" }, (invocation) => {
+      call = invocation;
+      return simSuccess(
+        xdr.ScVal.scvVec([
+          xdr.ScVal.scvSymbol("Invalid"),
+          xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("WindowRequiresWidth")]),
+        ]),
+      );
+    });
+    const config = xdr.ScVal.scvMap([
+      new xdr.ScMapEntry({
+        key: xdr.ScVal.scvSymbol("window_cap"),
+        // The value is irrelevant here: the test pins byte-for-byte passthrough
+        // of whatever encoded config the form built.
+        val: xdr.ScVal.scvU32(1),
+      }),
+    ]);
+
+    const result = await validatePolicy(server, MOCK_GUARD, config);
+
+    assert.deepEqual(result, {
+      ok: true,
+      value: { kind: "invalid", rule: "WindowRequiresWidth" },
+    });
+    assert.ok(call, "the preflight reached the RPC");
+    const seen = call as Invocation;
+    assert.equal(seen.args.length, 1, "the preflight carries exactly the candidate config");
+    assert.equal(
+      seen.args[0]!.toXDR("base64"),
+      config.toXDR("base64"),
+      "the bytes sent to validate_policy are the bytes set_policy would send",
+    );
+  });
+
+  test("Valid reads back as a passing verdict", async () => {
+    mock.onSimulate(
+      { fn: "validate_policy" },
+      simSuccess(xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("Valid")])),
+    );
+    assert.deepEqual(await validatePolicy(server, MOCK_GUARD, xdr.ScVal.scvVoid()), {
+      ok: true,
+      value: { kind: "valid" },
+    });
+  });
+
+  test("a contract trap on an older guard is a failed read, not a verdict", async () => {
+    // The entry point is additive: a guard deployed before issue #35's
+    // `validate_policy` exists traps here, and that must not read as either
+    // verdict — the caller treats no-verdict as "proceed" (issue #259).
+    mock.onSimulate({ fn: "validate_policy" }, contractTrap(4));
+    const result = await validatePolicy(server, MOCK_GUARD, xdr.ScVal.scvVoid());
+    assert.equal(result.ok, false);
+    assert.match(!result.ok ? result.error : "", /Error\(Contract, #4\)/);
+  });
+
+  test("an undecodable payload fails the read instead of reading as Valid", async () => {
+    mock.onSimulate({ fn: "validate_policy" }, simSuccess(xdr.ScVal.scvBool(true)));
+    const result = await validatePolicy(server, MOCK_GUARD, xdr.ScVal.scvVoid());
+    assert.equal(result.ok, false);
+    assert.match(!result.ok ? result.error : "", /unexpected validate_policy payload/);
   });
 });
 
@@ -318,3 +409,105 @@ function guardedCall(fn: string) {
     .setTimeout(30)
     .build();
 }
+
+// ── Issue #346: read-only endpoint health ──────────────────────────────────
+
+/** The answer a healthy endpoint gives, for probes with an injected transport. */
+function healthResponse(status: string): Response {
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { status } });
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+describe("endpoint health probe", () => {
+  test("reads a healthy endpoint off the wire and measures the trip", async () => {
+    const result = await probeRpcHealth(mock.url);
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.status, "healthy");
+    assert.match(result.endpointOrigin, /^http:\/\/127\.0\.0\.1:\d+$/);
+    assert.ok(result.latencyMs >= 0, "the round trip is measured, not guessed");
+  });
+
+  test("sends only a JSON-RPC method — no wallet, account or envelope data", async () => {
+    let raw = "";
+    const result = await probeRpcHealth("https://rpc.example.test/", {
+      fetchImpl: async (_input, init) => {
+        raw = String(init?.body ?? "");
+        return healthResponse("healthy");
+      },
+    });
+    assert.equal(result.ok, true, "the injected transport answered");
+    assert.ok(raw.length > 0, "a request body was sent");
+
+    const body = JSON.parse(raw) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(body).sort(), ["id", "jsonrpc", "method"]);
+    assert.equal(body["method"], "getHealth");
+    assert.equal(body["params"], undefined);
+  });
+
+  test("reports a malformed answer, then recovers on the next probe", async () => {
+    mock.injectFault(
+      { kind: "http", status: 200, body: JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) },
+      { method: "getHealth" },
+    );
+
+    const broken = await probeRpcHealth(mock.url);
+    assert.equal(broken.ok, false, "an answer without a health record is not health");
+    if (broken.ok) return;
+    assert.equal(broken.failure, "malformed");
+
+    // The fault is spent, so the endpoint answers properly the next time: a
+    // second probe is all the panel needs to recover, with no reload.
+    const recovered = await probeRpcHealth(mock.url);
+    assert.equal(recovered.ok, true);
+    if (!recovered.ok) return;
+    assert.equal(recovered.status, "healthy");
+  });
+
+  test("gives up on an endpoint that never answers", async () => {
+    // Accepts the connection and then says nothing at all — the state a
+    // stalled provider is actually in, and the one a fixed timeout must catch.
+    const hanging = createServer(() => undefined);
+    await new Promise<void>((resolve) => hanging.listen(0, "127.0.0.1", resolve));
+    const { port } = hanging.address() as AddressInfo;
+    try {
+      const result = await probeRpcHealth(`http://127.0.0.1:${port}/`, { timeoutMs: 60 });
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.equal(result.failure, "timeout");
+      assert.match(result.detail, /60ms/);
+      assert.ok(result.latencyMs >= 60, "the measured latency reaches the deadline");
+    } finally {
+      hanging.closeAllConnections();
+      await new Promise<void>((resolve) => hanging.close(() => resolve()));
+    }
+  });
+
+  test("calls a reachable endpoint reachability, never guard health", () => {
+    const healthy: RpcHealthResult = {
+      ok: true,
+      endpointOrigin: "https://soroban-testnet.stellar.org",
+      latencyMs: 12,
+      status: "healthy",
+    };
+    const copy = describeRpcHealth(healthy);
+    assert.equal(copy.tone, "ok");
+    assert.match(copy.label, /12 ms/);
+    assert.match(RPC_HEALTH_CAVEAT, /nothing about a guard/);
+
+    const unreachable: RpcHealthResult = {
+      ok: false,
+      endpointOrigin: "https://soroban-testnet.stellar.org",
+      latencyMs: 60,
+      failure: "network",
+      detail: "fetch failed",
+    };
+    const down = describeRpcHealth(unreachable);
+    assert.equal(down.tone, "warn");
+    assert.match(down.label, /60 ms/);
+    assert.match(down.headline, /could not be reached/);
+  });
+});
