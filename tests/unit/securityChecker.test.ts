@@ -1,13 +1,20 @@
-import { findFlagged, isFlagged, findFlaggedInDraft, registryVersion } from "../../lib/guard/securityChecker";
+import assert from "node:assert/strict";
+import { describe, test } from "node:test";
+import {
+  findFlagged,
+  isFlagged,
+  findFlaggedInDraft,
+  registryVersion,
+} from "../../lib/guard/securityChecker";
 
 describe("securityChecker", () => {
   test("isFlagged returns true for known flagged address", () => {
-    expect(isFlagged("GBADFLAGEXAMPLE000000000000000000000000000000000000000")).toBe(true);
+    assert.equal(isFlagged("GBADFLAGEXAMPLE000000000000000000000000000000000000000"), true);
   });
 
   test("findFlagged finds flagged addresses in array", () => {
     const found = findFlagged(["GPHISHINGADDR0000000000000000000000000000000000000000", "GOK"]);
-    expect(found).toContain("GPHISHINGADDR0000000000000000000000000000000000000000");
+    assert.ok(found.includes("GPHISHINGADDR0000000000000000000000000000000000000000"));
   });
 
   test("findFlaggedInDraft detects flagged addresses in form fields", () => {
@@ -17,13 +24,16 @@ describe("securityChecker", () => {
       protocols: "GOKPROTO\nGBADFLAGEXAMPLE000000000000000000000000000000000000000:swap",
     };
     const found = findFlaggedInDraft(draft);
-    expect(found.sort()).toEqual([
-      "GBADFLAGEXAMPLE000000000000000000000000000000000000000",
-      "GPHISHINGADDR0000000000000000000000000000000000000000",
-    ].sort());
+    assert.deepEqual(
+      found.sort(),
+      [
+        "GBADFLAGEXAMPLE000000000000000000000000000000000000000",
+        "GPHISHINGADDR0000000000000000000000000000000000000000",
+      ].sort(),
+    );
   });
 
   test("registryVersion is populated", () => {
-    expect(registryVersion()).toMatch(/2026/);
+    assert.match(registryVersion(), /2026/);
   });
 });

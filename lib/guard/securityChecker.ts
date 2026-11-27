@@ -32,18 +32,28 @@ export function findFlagged(addresses: string[] | undefined): string[] {
  * Given the freeform fields from the policy form, return the list of flagged
  * addresses present. This is convenient for consumers (UI) and for unit tests.
  */
-export function findFlaggedInDraft(options: { assets?: string; recipients?: string; protocols?: string }): string[] {
+export function findFlaggedInDraft(options: {
+  assets?: string;
+  recipients?: string;
+  protocols?: string;
+}): string[] {
   const { assets = "", recipients = "", protocols = "" } = options;
 
-  const assetsList = assets.split(/\r?\n/).map((s) => s.split(" ")[0]).map((s) => s.trim()).filter(Boolean);
-  const recipientsList = recipients.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const assetsList = assets
+    .split(/\r?\n/)
+    .map((s) => (s.split(" ")[0] ?? "").trim())
+    .filter(Boolean);
+  const recipientsList = recipients
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 
   // protocols lines may be of the form: ADDRESS or ADDRESS:fn
   const protocolsList = protocols
     .split(/\r?\n/)
     .map((s) => s.trim())
     .filter(Boolean)
-    .map((s) => (s.includes(":") ? s.split(":")[0].trim() : s));
+    .map((s) => (s.split(":")[0] ?? "").trim());
 
   const all = [...assetsList, ...recipientsList, ...protocolsList];
   return Array.from(new Set(findFlagged(all)));

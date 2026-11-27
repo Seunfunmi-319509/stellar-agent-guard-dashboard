@@ -400,25 +400,18 @@ bumps for both `github-actions` and `npm`.
 
 ## CI: e2e and visual jobs
 
-- This repository now runs Playwright-based end-to-end (`e2e`) and visual test
-  jobs in CI. They are configured to run on `ubuntu-latest` using `chromium` and
-  to upload traces, screenshots and test results when failures occur. The CI
-  jobs run on every push and PR, but they are intentionally not a required
-  branch-protection check by default: maintainers should enable the required
-  status after the suite demonstrates stability (recommended: three
-  consecutive green CI runs) as described in issue #43.
-
-- To update visual baselines locally run:
-
-```bash
-npm run test:visual:update
-```
-
-- CI uses `npx playwright install --with-deps chromium` to install browser
-  dependencies (Playwright CI guidance). Artifacts retained on failure are
-  uploaded and kept for 7 days for triage.
-
-If you're claiming issue #43, open a PR from a branch named
-`feat(tests)/ci-e2e-visual-jobs-in-github-actions-post-harness-stabilization`,
-reference the issue in the PR body (`Closes #43`), and ask a maintainer to
-flip the required status after three consecutive green runs.
+- Two Playwright jobs run on every push and pull request, on `ubuntu-latest`
+  with Chromium:
+  - **e2e**, the last step of the `ci` job in `.github/workflows/ci.yml`, which runs
+    `npm run test:e2e` (`tests/e2e/`).
+  - **visual regression** (`.github/workflows/visual-tests.yml`), which runs
+    `npm run test:visual` (`tests/visual/`) against the production build.
+- On failure, both jobs upload the Playwright HTML report and `test-results`
+  (traces, screenshots and diffs) as a workflow artifact for triage.
+- Visual baselines are generated in CI only. Do not commit the output of
+  `npm run test:visual:update`; see
+  [Visual regression baselines](#visual-regression-baselines) for the
+  `update-screenshots` flow.
+- Neither job is a required branch-protection check yet. Maintainers should
+  make them required once the suite has shown it is stable (recommended: three
+  consecutive green runs on `main`), as tracked in issue #43.
